@@ -4,4 +4,4 @@
 
 *Vincenzo Pasquadibisceglie, Annalisa Appice, Donato Lucente, Donato Malerba*
 
-[*FOX: a neuro-Fuzzy model for process Outcome prediction and eXplanation*]
+[*FAIRY: an approach for concept drift detection and adaptation in process discovery*]

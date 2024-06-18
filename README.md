@@ -1,6 +1,7 @@
 # A Stream Data Mining Approach to Handle Concept Drifts in Process Discovery	
 
 **The repository contains code referred to the work:**
+
 *Vincenzo Pasquadibisceglie, Donato Lucente, Donato Malerba*
 
 

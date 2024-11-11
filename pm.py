@@ -10,6 +10,7 @@ import numpy as np
 import pandas
 from collections import deque
 from matplotlib import pyplot
+from numpy.f2py.crackfortran import verbose
 from pandas import DataFrame, read_csv
 from time import process_time
 from tempfile import TemporaryDirectory
@@ -22,10 +23,15 @@ from pm4py.objects.conversion.bpmn import converter as bpmn_converter
 from pm4py.objects.petri_net.exporter import exporter as pnml_exporter
 from pm4py.streaming.importer.csv import importer as csv_stream_importer
 from pm4py.algo.discovery.inductive import algorithm as inductive_miner
+#from pm4py.algo.discovery.ilp import algorithm as ilp_miner
 from pm4py.algo.evaluation.replay_fitness import algorithm as fitness_evaluator
 from pm4py.algo.evaluation.precision import algorithm as precision_evaluator
 from pm4py.visualization.petri_net import visualizer as pn_visualizer
 from river.drift import ADWIN
+#from sympy.abc import alpha
+import pm4py
+import time
+from datetime import datetime
 from dl import Abstractor
 pandas.options.mode.chained_assignment = None  # default='warn'
 
@@ -38,6 +44,7 @@ class Algo(Enum):
     IND = 1
     SPL = 2
     ILP = 3
+
 
 
 class Order(Enum):
@@ -120,7 +127,8 @@ class Miner:
         self.drift_moments = []
         self.drift_variants = []
         self.evaluations = []
-
+        #self.new_model_counter = 0
+        self.training_time = 0
         self.smoothed_freq_dictionary = Counter()
         self.smooth = smooth
         self.trace_window_size = trace_window_size
@@ -132,7 +140,22 @@ class Miner:
         self.parallelism_threshold = parallelism_threshold
         self.summarization = summarization
         self.abstractor = None
+        self.model_update = False
+        self.cont_model = 0
+        self.current_time = 0
 
+    def time_format(self, time_stamp):
+        '''
+        :param time_stamp: oggetto timestamp
+        :return: converte l'oggetto timestamp utile in fase di calcolo dei tempi
+        '''
+        try:
+            date_format_str = '%Y-%m-%d %H:%M:%S.%f%z'
+            conversion = datetime.strptime(time_stamp, date_format_str)
+        except:
+            date_format_str = '%Y-%m-%d %H:%M:%S%f%z'
+            conversion = datetime.strptime(time_stamp, date_format_str)
+        return conversion
     def process_stream(self):
         """
         Processa iterativamente uno stream di eventi in formato CSV, ignorando attività che si ripetano in modo
@@ -150,6 +173,13 @@ class Miner:
         for event in stream:
             case = event[CASE_ID_KEY]
             activity = event[ACTIVITY_KEY]
+            if self.model_update == True:
+                start_time = self.time_format(self.last_time_event)
+                end_time = self.time_format(event['time:timestamp'])
+                diff = end_time - start_time
+                self.current_time = 86400 * diff.days + diff.seconds + diff.microseconds / 1000000
+
+
             if activity == FINAL_ACTIVITY:
                 new_trace = tuple(traces.pop(case))
                 self.variants[new_trace] += 1
@@ -162,7 +192,8 @@ class Miner:
                 if self.processed_traces == self.cut:
                     if self.summarization:
                         self.abstractor = Abstractor(self.variants, self.log_name, self.calculate_pareto_denominator())
-                        self.abstractor.build_neural_network_model()
+                        #self.abstractor.build_neural_network_model()
+                        self.abstractor.find_hyperparameters()
                     self.select_best_variants()
                     self.learn_model(self.best_variants) if not self.summarization else \
                         self.learn_model(self.abstractor.build_summary(self.variants))
@@ -175,7 +206,7 @@ class Miner:
                     stdout.write(f'\rCurrent model: {len(self.models)}\tCurrent trace: {self.processed_traces}')
                     self.evaluations.append(self.evaluate_model(new_trace))
                     if self.update:
-                        self.discover_concept_drift()
+                        self.discover_concept_drift(event)
                     end = process_time()
                     self.evaluations[-1].append(end - start)
                     start = end
@@ -215,13 +246,13 @@ class Miner:
             self.filtering = True
             self.frequency = True
 
-    def discover_concept_drift(self):
+    def discover_concept_drift(self, event):
         """
         Richiama il metodo preposto alla scoperta dei concept drift, in base all' approccio definito in fase di
         inizializzazione.
         """
         if self.drift_discover_algorithm == DriftDiscoverMode.ADWIN:
-            self.concept_drift_finder_with_adwin(self.evaluations[-1][2])
+            self.concept_drift_finder_with_adwin(self.evaluations[-1][2], event)
         else:
             self.select_best_variants()
             if self.best_variants.keys() != self.drift_variants[-1].keys():
@@ -229,7 +260,12 @@ class Miner:
                     self.learn_model(self.best_variants)
                 else:
                     self.abstractor.update_training_set(self.variants, self.calculate_pareto_denominator())
+                    start_time = time.process_time()
                     self.abstractor.build_neural_network_model()
+                    end_time = time.process_time()
+                    self.last_time_event = event['time:timestamp']
+                    self.training_time = end_time - start_time
+                    self.model_update = True
                     self.learn_model(self.abstractor.build_summary(self.variants))
 
     def build_variants_dictionary(self, new_trace):
@@ -359,10 +395,12 @@ class Miner:
             else:
                 log.append(Trace({ACTIVITY_KEY: activity} for activity in variant))
         if self.algo == Algo.IND:
-            variant = inductive_miner.Variants.IMf if self.filtering else inductive_miner.Variants.IM
-            model = inductive_miner.apply(log, variant=variant, parameters={
-                variant.value.Parameters.NOISE_THRESHOLD: self.filter_treshold}) if self.filtering \
-                else inductive_miner.apply(log, variant=variant)
+            model = pm4py.discovery.discover_petri_net_inductive(log, noise_threshold=0.2)
+        elif self.algo == Algo.ILP:
+            model = pm4py.discovery.discover_petri_net_ilp(log, alpha=0.25)
+            #model = pm4py.discovery.discover_petri_net_inductive(log, noise_threshold=0.1)
+
+
         else:
             with TemporaryDirectory() as temp:
                 log_path = path.join(temp, 'log.xes')
@@ -375,9 +413,27 @@ class Miner:
                 subprocess.call(args, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
                 model = bpmn_converter.apply(read_bpmn(model_path)) if self.algo == Algo.SPL else read_pnml(model_path)
         self.models.append(model)
+        #self.new_model_counter +=1
         self.drift_moments.append(self.processed_traces)
         self.drift_variants.append(self.best_variants)
 
+
+    def get_prev_model(self, log):
+        i = -1
+        while True:
+            try:
+                fitness = pm4py.fitness_alignments(log, *self.models[i], multi_processing=False)['average_trace_fitness']
+                # variant = precision_evaluator.Variants.ALIGN_ETCONFORMANCE
+                # parameters = {variant.value.Parameters.SHOW_PROGRESS_BAR: False}
+                #precision = pm4py.precision_alignments(log, *self.models[i], multi_processing=True)
+                variant = precision_evaluator.Variants.ALIGN_ETCONFORMANCE
+                parameters = {variant.value.Parameters.SHOW_PROGRESS_BAR: False}
+                # precision = pm4py.precision_alignments(log, *self.models[-1], multi_processing=False, parameters=parameters)
+                precision = precision_evaluator.apply(log, *self.models[i], variant=variant, parameters=parameters)
+                return fitness, precision
+                break
+            except:
+                i = i - 1
     def evaluate_model(self, trace):
         """
         Valuta il modello di processo sull'istanza fornita in input
@@ -385,11 +441,33 @@ class Miner:
         :return results: lista contenente in posizione 0 la fitness, 1 la precision, 2 la f_measure
         """
         log = EventLog([Trace({ACTIVITY_KEY: activity} for activity in trace)])
-        variant = fitness_evaluator.Variants.ALIGNMENT_BASED
-        fitness = fitness_evaluator.apply(log, *self.models[-1], variant=variant)['average_trace_fitness']
-        variant = precision_evaluator.Variants.ALIGN_ETCONFORMANCE
-        parameters = {variant.value.Parameters.SHOW_PROGRESS_BAR: False}
-        precision = precision_evaluator.apply(log, *self.models[-1], variant=variant, parameters=parameters)
+        #variant = fitness_evaluator.Variants.ALIGNMENT_BASED
+
+        if self.model_update==True:
+            if self.current_time<self.training_time:
+                fitness, precision = self.get_prev_model(log)
+            else:
+                self.model_update = False
+                try:
+                    fitness = pm4py.fitness_alignments(log, *self.models[-1], multi_processing=False)[
+                        'average_trace_fitness']
+                    variant = precision_evaluator.Variants.ALIGN_ETCONFORMANCE
+                    parameters = {variant.value.Parameters.SHOW_PROGRESS_BAR: False}
+                    # precision = pm4py.precision_alignments(log, *self.models[-1], multi_processing=False, parameters=parameters)
+                    precision = precision_evaluator.apply(log, *self.models[-1], variant=variant, parameters=parameters)
+                except:
+                    fitness, precision = self.get_prev_model(log)
+        else:
+            try:
+                fitness = pm4py.fitness_alignments(log, *self.models[-1], multi_processing=False)['average_trace_fitness']
+                variant = precision_evaluator.Variants.ALIGN_ETCONFORMANCE
+                parameters = {variant.value.Parameters.SHOW_PROGRESS_BAR: False}
+                #precision = pm4py.precision_alignments(log, *self.models[-1], multi_processing=False, parameters=parameters)
+                precision = precision_evaluator.apply(log, *self.models[-1], variant=variant, parameters=parameters)
+
+            except:
+                fitness, precision = self.get_prev_model(log)
+
         f_measure = 2 * fitness * precision / (fitness + precision) if fitness != 0 else 0
         return [fitness, precision, f_measure]
 
@@ -402,7 +480,7 @@ class Miner:
         for trace in self.window_queue:
             self.adwin.update(self.evaluate_model(trace)[2])
 
-    def concept_drift_finder_with_adwin(self, f_measure):
+    def concept_drift_finder_with_adwin(self, f_measure, event):
         """
         La funzione si occupa di passare la f-measure calcolata all' algoritmo ADWIN e se quest' ultimo, dopo aver
         aggiunto il nuovo valore rileva un concept drift, vengono utilizzati i trace della finestra rilevata da ADWIN
@@ -418,7 +496,15 @@ class Miner:
                 self.variants.pop(old_trace) if self.variants[old_trace] == 0 else None
             if self.summarization:
                 self.abstractor.update_training_set(self.variants, self.calculate_pareto_denominator())
+                #self.abstractor.build_neural_network_model()
+                start_time = time.process_time()
                 self.abstractor.build_neural_network_model()
+                end_time = time.process_time()
+                self.last_time_event = event['time:timestamp']
+                self.training_time = end_time - start_time
+                self.model_update = True
+
+
             self.select_best_variants()
             self.learn_model(self.best_variants) if not self.summarization else \
                 self.learn_model(self.abstractor.build_summary(self.variants))
@@ -506,10 +592,10 @@ class Miner:
         evaluation.to_csv(path.join(folder, file + '.csv'))
         folder = path.join('results', self.log_name, 'petri')
         makedirs(folder, exist_ok=True)
-        for index, model in enumerate(self.models):
-            model_info = f'-{index}' if self.update else ''
-            pnml_exporter.apply(model[0], model[1], path.join(folder, file + model_info + '.pnml'), model[2])
-            pn_visualizer.save(pn_visualizer.apply(*model), path.join(folder, file + model_info + '.png'))
+        #for index, model in enumerate(self.models):
+        #    model_info = f'-{index}' if self.update else ''
+        #    pnml_exporter.apply(model[0], model[1], path.join(folder, file + model_info + '.pnml'), model[2])
+        #    pn_visualizer.save(pn_visualizer.apply(*model), path.join(folder, file + model_info + '.png'))
 
     def save_variant_histogram(self, y_log=False):
         """

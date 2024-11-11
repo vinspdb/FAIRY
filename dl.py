@@ -12,10 +12,26 @@ from tensorflow.keras.utils import to_categorical
 from sklearn.model_selection import train_test_split
 import tensorflow as tf
 from pathlib import Path
+from time import perf_counter
+from hyperopt import Trials, STATUS_OK, tpe, fmin, hp
+import hyperopt
+from hyperopt.pyll.base import scope
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
 FINAL_ACTIVITY_SYMBOL = '_END_'
 
-
+space = {'cellsize': scope.int(hp.loguniform('cellsize', np.log(10), np.log(150))),
+         'dropout': hp.uniform("dropout", 0, 1),
+         'batch_size': hp.choice('batch_size', [7, 8, 9, 10]),
+         'learning_rate': hp.loguniform("learning_rate", np.log(0.00001), np.log(0.01)),
+         'n_layers': hp.choice('n_layers', [
+             {'n_layers': 1},
+             {'n_layers': 2, 'cellsize22': scope.int(hp.loguniform('cellsize22', np.log(10), np.log(150)))},
+             {'n_layers': 3, 'cellsize32': scope.int(hp.loguniform('cellsize32', np.log(10), np.log(150))),
+              'cellsize33': scope.int(hp.loguniform('cellsize33', np.log(10), np.log(150)))}
+         ])
+         }
 class Abstractor:
 
     def __init__(self, histogram, dataset_name, trace_window_size, examples_size=4):
@@ -40,6 +56,10 @@ class Abstractor:
         tf.random.set_seed(seed)
         self.le = preprocessing.LabelEncoder()
         self.y_training = self.le.fit_transform(self.y_training)
+        self.best_score = np.inf
+        self.best_model = None
+        self.best_time = 0
+        self.best_numparameters = 0
 
     def map_dictionary_init(self):
         """
@@ -159,6 +179,38 @@ class Abstractor:
                 seeds.append(list(list(candidate_seeds.keys())[i]))
         return seeds if use_pareto else candidate_seeds
 
+
+    def find_hyperparameters(self):
+
+        outfile = open(self.dataset_name + '.log', 'w')
+        trials = Trials()
+        best = fmin(self.train_and_evaluate_model, space, algo=tpe.suggest, max_evals=20, trials=trials,
+                    rstate=np.random.RandomState(42))
+        self.best_params = hyperopt.space_eval(space, best)
+
+        outfile.write("\nHyperopt trials")
+        outfile.write("\ntid,loss,learning_rate,n_modules,batch_size,time,n_epochs,n_params,perf_time")
+        for trial in trials.trials:
+            outfile.write("\n%d,%f,%f,%d,%d,%s,%d,%d,%f" % (trial['tid'],
+                                                               trial['result']['loss'],
+                                                               trial['misc']['vals']['learning_rate'][
+                                                                   0],
+                                                               int(trial['misc']['vals']['n_layers'][
+                                                                       0] + 1),
+                                                               trial['misc']['vals']['batch_size'][
+                                                                   0] + 5,
+                                                               (trial['refresh_time'] - trial[
+                                                                   'book_time']).total_seconds(),
+                                                               trial['result']['n_epochs'],
+                                                               trial['result']['n_params'],
+                                                               trial['result']['time']))
+
+        outfile.write("\n\nBest parameters:")
+        outfile.write("\nModel parameters: %d" % self.best_numparameters)
+        outfile.write('\nBest Time taken: %f' % self.best_time)
+        self.best_model.save("model/generate_" + self.dataset_name + ".h5")
+
+
     def build_neural_network_model(self):
         """
         La funzione si occupa di istanziare e addestrare una rete neurale utilizzando il dataset generato in precedenza.
@@ -174,22 +226,101 @@ class Abstractor:
         input_act = Input(shape=(self.examples_size,), dtype='int32', name='input_act')
         x_act = Embedding(output_dim=size_act, input_dim=unique_events + 1, input_length=self.examples_size)(
             input_act)
-        layer_l = LSTM(16, return_sequences=True, kernel_initializer='glorot_uniform')(x_act)
-        layer_l = BatchNormalization()(layer_l)
-        layer_l = LSTM(16, return_sequences=False, kernel_initializer='glorot_uniform')(layer_l)
-        layer_l = BatchNormalization()(layer_l)
-        output = Dense(outsize, activation='softmax', name='act_output')(layer_l)
+
+        n_layers = int(self.best_params["n_layers"]["n_layers"])
+
+        x = (tf.keras.layers.LSTM(int(self.best_params["cellsize"]),
+                                  kernel_initializer='glorot_uniform',
+                                  return_sequences=(n_layers != 1),
+                                  ))(x_act)
+
+        x = tf.keras.layers.Dropout(self.best_params["dropout"])(x)
+
+        for i in range(2, n_layers + 1):
+            return_sequences = (i != n_layers)
+            x = (tf.keras.layers.LSTM(int(self.best_params["n_layers"]["cellsize%s%s" % (n_layers, i)]),
+                                      kernel_initializer='glorot_uniform',
+                                      return_sequences=return_sequences,
+                                      ))(x)
+
+            x = tf.keras.layers.Dropout(self.best_params["dropout"])(x)
+
+        output = Dense(outsize, activation='softmax')(x)
         model = Model(inputs=input_act, outputs=output)
-        print(model.summary())
-        opt = Adam()
-        model.compile(loss={'act_output': 'categorical_crossentropy'}, optimizer=opt, metrics=['accuracy'])
+        opt = Adam(learning_rate=self.best_params['learning_rate'])
+        model.compile(loss='categorical_crossentropy', optimizer=opt, metrics=['accuracy'])
         early_stopping = EarlyStopping(monitor='val_loss',
                                        patience=20)
         lr_reducer = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, verbose=0, mode='auto',
                                        min_delta=0.0001, cooldown=0, min_lr=0)
-        model.fit(X_train, Y_train, epochs=200, batch_size=128, verbose=1, callbacks=[early_stopping, lr_reducer],
+        model.fit(X_train, Y_train, epochs=200, batch_size=self.best_params['batch_size'], verbose=0, callbacks=[early_stopping, lr_reducer],
                   validation_data=(X_val, Y_val))
         model.save("model/generate_" + self.dataset_name + ".h5")
+
+    def get_model(self, params, outsize):
+        n_layers = int(params["n_layers"]["n_layers"])
+        unique_events = len(self.mapping_dictionary)
+
+        size_act = (unique_events + 1) // 2
+        input_act = Input(shape=(self.examples_size,), dtype='int32', name='input_act')
+        x_act = Embedding(output_dim=size_act, input_dim=unique_events + 1, input_length=self.examples_size)(
+            input_act)
+
+        x = (tf.keras.layers.LSTM(int(params["cellsize"]),
+                                  kernel_initializer='glorot_uniform',
+                                  return_sequences=(n_layers != 1)
+                                  ))(x_act)
+
+        x = tf.keras.layers.Dropout(params["dropout"])(x)
+
+        for i in range(2, n_layers + 1):
+            return_sequences = (i != n_layers)
+            x = (tf.keras.layers.LSTM(int(params["n_layers"]["cellsize%s%s" % (n_layers, i)]),
+                                      kernel_initializer='glorot_uniform',
+                                      return_sequences=return_sequences,
+                                      ))(x)
+
+            x = tf.keras.layers.Dropout(params["dropout"])(x)
+
+        out_a = Dense(outsize, activation='softmax', kernel_initializer='glorot_uniform', name='output_a')(x)
+
+        model = Model(inputs=input_act, outputs=out_a)
+        opt = Adam(learning_rate=params["learning_rate"])
+        model.compile(loss='categorical_crossentropy', optimizer=opt, metrics=['acc'])
+        return model
+
+
+    def train_and_evaluate_model(self, params):
+        self.x_training = np.asarray(self.x_training)
+        outsize = len(np.unique(self.y_training))
+        X_train, X_val, Y_train, Y_val = train_test_split(self.x_training, to_categorical(self.y_training), test_size=0.2,
+                                                          random_state=42, shuffle=True)
+        start_time = perf_counter()
+        model = self.get_model(params, outsize)
+
+        early_stopping = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
+        lr_reducer = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=100, verbose=0, mode='auto',
+                                       min_delta=0.0001, cooldown=0, min_lr=0)
+
+        history = model.fit(X_train, Y_train,
+                            validation_data=(X_val, Y_val), verbose=0,
+                            callbacks=[early_stopping, lr_reducer],
+                            batch_size=2 ** params['batch_size'], epochs=200)
+
+        scores = [history.history['val_loss'][epoch] for epoch in range(len(history.history['loss']))]
+        score = min(scores)
+        end_time = perf_counter()
+
+        if self.best_score > score:
+            self.best_score = score
+            self.best_model = model
+            self.best_numparameters = model.count_params()
+            self.best_time = end_time - start_time
+
+
+
+        return {'loss': score, 'status': STATUS_OK, 'n_epochs': len(history.history['loss']),
+                'n_params': model.count_params(), 'time': end_time - start_time}
 
     def predict_variants(self):
         """
@@ -241,7 +372,7 @@ class Abstractor:
         """
         self.trace_histogram = updated_variants_histogram
         self.trace_max_lenght = self.set_max_trace_size()
-        self.variant_seeds = self.find_variant_seeds(2, False)
+        self.variant_seeds = self.find_variant_seeds(1, False)
         return self.predict_variants()
 
     def is_already_trained(self):

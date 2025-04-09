@@ -5,7 +5,7 @@ from enum import Enum
 from collections import Counter
 from datetime import timedelta
 from os import path, makedirs, listdir
-
+from scipy import stats
 import numpy as np
 import pandas
 from collections import deque
@@ -27,12 +27,13 @@ from pm4py.algo.discovery.inductive import algorithm as inductive_miner
 from pm4py.algo.evaluation.replay_fitness import algorithm as fitness_evaluator
 from pm4py.algo.evaluation.precision import algorithm as precision_evaluator
 from pm4py.visualization.petri_net import visualizer as pn_visualizer
-from river.drift import ADWIN
+from river.drift import ADWIN, EDDM, DDM, EDDM, HDDM_W
 #from sympy.abc import alpha
 import pm4py
 import time
 from datetime import datetime
-from dl import Abstractor
+
+
 pandas.options.mode.chained_assignment = None  # default='warn'
 
 CASE_ID_KEY = 'case:concept:name'
@@ -62,6 +63,8 @@ class Smooth(Enum):
 class DriftDiscoverMode(Enum):
     NORMAL = 1
     ADWIN = 2
+    HDDM_W = 3
+    EDDM = 4
 
 
 class Miner:
@@ -90,7 +93,8 @@ class Miner:
             makedirs(path.dirname(csv_path), exist_ok=True)
             dataframe.to_csv(csv_path, index=False)
 
-    def __init__(self, log_name, order, algo, cut, top, filtering=False, frequency=False, update=False, smooth=None,
+    def __init__(self, log_name, order, algo, cut, top, method, result_name,filtering=False, frequency=False, update=False,
+                 smooth=None,
                  trace_window_size=0, drift_discover_algorithm=DriftDiscoverMode.NORMAL, no_sampling=False,
                  filter_treshold=None, parallelism_threshold=0.1, summarization=False):
         """
@@ -127,7 +131,7 @@ class Miner:
         self.drift_moments = []
         self.drift_variants = []
         self.evaluations = []
-        #self.new_model_counter = 0
+        # self.new_model_counter = 0
         self.training_time = 0
         self.smoothed_freq_dictionary = Counter()
         self.smooth = smooth
@@ -143,6 +147,9 @@ class Miner:
         self.model_update = False
         self.cont_model = 0
         self.current_time = 0
+        self.method = method
+        self.warning_drift = []
+        self.result_name = result_name
 
     def time_format(self, time_stamp):
         '''
@@ -156,6 +163,7 @@ class Miner:
             date_format_str = '%Y-%m-%d %H:%M:%S%f%z'
             conversion = datetime.strptime(time_stamp, date_format_str)
         return conversion
+
     def process_stream(self):
         """
         Processa iterativamente uno stream di eventi in formato CSV, ignorando attività che si ripetano in modo
@@ -170,6 +178,7 @@ class Miner:
         self.init_window_queue()
         self.no_sampling_mode_init()
         self.set_default_filter_value()
+        computation_time = open('computation_time_'+self.log_name+'_'+str(self.algo)+'.txt', 'w')
         for event in stream:
             case = event[CASE_ID_KEY]
             activity = event[ACTIVITY_KEY]
@@ -179,20 +188,33 @@ class Miner:
                 diff = end_time - start_time
                 self.current_time = 86400 * diff.days + diff.seconds + diff.microseconds / 1000000
 
-
             if activity == FINAL_ACTIVITY:
+                init_time = time.time()
                 new_trace = tuple(traces.pop(case))
                 self.variants[new_trace] += 1
                 self.processed_traces += 1
-                if self.drift_discover_algorithm == DriftDiscoverMode.ADWIN:
+                if self.drift_discover_algorithm == DriftDiscoverMode.ADWIN or self.drift_discover_algorithm == DriftDiscoverMode.HDDM_W or self.drift_discover_algorithm.EDDM == DriftDiscoverMode.EDDM:
                     self.window_queue.append(new_trace)
                 if self.processed_traces > self.cut - self.trace_window_size and self.drift_discover_algorithm == \
                         DriftDiscoverMode.NORMAL:
                     self.build_variants_dictionary(new_trace)
                 if self.processed_traces == self.cut:
+
                     if self.summarization:
-                        self.abstractor = Abstractor(self.variants, self.log_name, self.calculate_pareto_denominator())
-                        #self.abstractor.build_neural_network_model()
+                        if self.method == 'LSTM':
+                            from dl import Abstractor
+                            self.abstractor = Abstractor(self.variants, self.log_name,
+                                                         self.calculate_pareto_denominator())
+                        elif self.method == 'Transformers':
+                            from dl_ts import Abstractor
+                            self.abstractor = Abstractor(self.variants, self.log_name,
+                                                         self.calculate_pareto_denominator())
+                        else:
+                            from ml import Abstractor
+                            print('method', self.method)
+                            self.abstractor = Abstractor(self.variants, self.log_name,
+                                                         self.calculate_pareto_denominator(), self.method)
+                        # self.abstractor.build_neural_network_model()
                         self.abstractor.find_hyperparameters()
                     self.select_best_variants()
                     self.learn_model(self.best_variants) if not self.summarization else \
@@ -200,7 +222,7 @@ class Miner:
                     end = process_time()
                     self.evaluations.append([None, None, None, end - start])
                     start = end
-                    if self.drift_discover_algorithm == DriftDiscoverMode.ADWIN:
+                    if self.drift_discover_algorithm == DriftDiscoverMode.ADWIN or self.drift_discover_algorithm == DriftDiscoverMode.EDDM or self.drift_discover_algorithm == DriftDiscoverMode.HDDM_W:
                         self.adwin_window_init()
                 elif self.processed_traces > self.cut:
                     stdout.write(f'\rCurrent model: {len(self.models)}\tCurrent trace: {self.processed_traces}')
@@ -210,6 +232,8 @@ class Miner:
                     end = process_time()
                     self.evaluations[-1].append(end - start)
                     start = end
+                end_comp_time = time.time()-init_time
+                computation_time.write(str(end_comp_time)+'\n')
             elif case not in traces:
                 traces[case] = [activity]
             elif len(traces[case]) == 1 or traces[case][-1] != activity or traces[case][-2] != activity:
@@ -234,7 +258,7 @@ class Miner:
         """
         if self.smooth == Smooth.SLW or self.smooth == Smooth.SMA:
             self.window_queue = deque(maxlen=self.trace_window_size)
-        elif self.drift_discover_algorithm == DriftDiscoverMode.ADWIN:
+        elif self.drift_discover_algorithm == DriftDiscoverMode.ADWIN or self.drift_discover_algorithm == DriftDiscoverMode.EDDM or self.drift_discover_algorithm == DriftDiscoverMode.HDDM_W:
             self.window_queue = deque()
 
     def no_sampling_mode_init(self):
@@ -251,7 +275,7 @@ class Miner:
         Richiama il metodo preposto alla scoperta dei concept drift, in base all' approccio definito in fase di
         inizializzazione.
         """
-        if self.drift_discover_algorithm == DriftDiscoverMode.ADWIN:
+        if self.drift_discover_algorithm == DriftDiscoverMode.ADWIN or self.drift_discover_algorithm == DriftDiscoverMode.HDDM_W or self.drift_discover_algorithm == DriftDiscoverMode.EDDM:
             self.concept_drift_finder_with_adwin(self.evaluations[-1][2], event)
         else:
             self.select_best_variants()
@@ -312,7 +336,7 @@ class Miner:
         """
         Definisce il denominatore da utilizzare per il calcolo di Pareto secondo il criterio di smoothing selezionato
         """
-        if self.drift_discover_algorithm == DriftDiscoverMode.ADWIN:
+        if self.drift_discover_algorithm == DriftDiscoverMode.ADWIN or self.drift_discover_algorithm == DriftDiscoverMode.HDDM_W or self.drift_discover_algorithm == DriftDiscoverMode.EDDM:
             return len(self.window_queue)
         elif self.smooth == Smooth.SMA:
             return 1
@@ -398,9 +422,6 @@ class Miner:
             model = pm4py.discovery.discover_petri_net_inductive(log, noise_threshold=0.2)
         elif self.algo == Algo.ILP:
             model = pm4py.discovery.discover_petri_net_ilp(log, alpha=0.25)
-            #model = pm4py.discovery.discover_petri_net_inductive(log, noise_threshold=0.1)
-
-
         else:
             with TemporaryDirectory() as temp:
                 log_path = path.join(temp, 'log.xes')
@@ -423,12 +444,8 @@ class Miner:
         while True:
             try:
                 fitness = pm4py.fitness_alignments(log, *self.models[i], multi_processing=False)['average_trace_fitness']
-                # variant = precision_evaluator.Variants.ALIGN_ETCONFORMANCE
-                # parameters = {variant.value.Parameters.SHOW_PROGRESS_BAR: False}
-                #precision = pm4py.precision_alignments(log, *self.models[i], multi_processing=True)
                 variant = precision_evaluator.Variants.ALIGN_ETCONFORMANCE
                 parameters = {variant.value.Parameters.SHOW_PROGRESS_BAR: False}
-                # precision = pm4py.precision_alignments(log, *self.models[-1], multi_processing=False, parameters=parameters)
                 precision = precision_evaluator.apply(log, *self.models[i], variant=variant, parameters=parameters)
                 return fitness, precision
                 break
@@ -469,6 +486,7 @@ class Miner:
                 fitness, precision = self.get_prev_model(log)
 
         f_measure = 2 * fitness * precision / (fitness + precision) if fitness != 0 else 0
+
         return [fitness, precision, f_measure]
 
     def adwin_window_init(self):
@@ -476,10 +494,37 @@ class Miner:
         Inizializza la finestra utilizzata dall' oggetto ADWIN con i trace utilizzati per la generazione del primo
         modello.
         """
-        self.adwin = ADWIN()
-        for trace in self.window_queue:
-            self.adwin.update(self.evaluate_model(trace)[2])
+        list_threshold = []
+        if self.drift_discover_algorithm == DriftDiscoverMode.ADWIN:
+            self.adwin = ADWIN()
+            for trace in self.window_queue:
+                self.adwin.update(self.evaluate_model(trace)[2])
 
+        elif self.drift_discover_algorithm == DriftDiscoverMode.HDDM_W:
+            self.adwin = HDDM_W()#DDM(warning_level=0.1, out_control_level=0.5)#
+            for trace in self.window_queue:
+                list_threshold.append(self.evaluate_model(trace)[2])
+            #IQR = stats.iqr(list_threshold, interpolation='midpoint')
+            self.threshold_detector = np.mean(list_threshold)#np.percentile(list_threshold,25)#
+            #print('threshold--->', self.threshold_detector)
+            for trace in list_threshold:
+                if trace > self.threshold_detector:
+                    self.adwin.update(0)
+                else:
+                    self.adwin.update(1)
+
+        elif self.drift_discover_algorithm == DriftDiscoverMode.EDDM:
+                self.adwin = EDDM()
+                for trace in self.window_queue:
+                    list_threshold.append(self.evaluate_model(trace)[2])
+                #IQR = stats.iqr(list_threshold, interpolation='midpoint')
+                self.threshold_detector = np.mean(list_threshold)#np.percentile(list_threshold, 25)
+                #self.threshold_detector = np.mean(list_threshold)
+                for trace in list_threshold:
+                    if trace > self.threshold_detector:
+                       self.adwin.update(0)
+                    else:
+                       self.adwin.update(1)
     def concept_drift_finder_with_adwin(self, f_measure, event):
         """
         La funzione si occupa di passare la f-measure calcolata all' algoritmo ADWIN e se quest' ultimo, dopo aver
@@ -487,9 +532,33 @@ class Miner:
         su cui il concept drift si è verificato per la generazione di un nuovo modello.
         :param f_measure: f-measure calcolata sull' ultimo trace letto.
         """
-        in_drift, in_warning = self.adwin.update(f_measure)
+
+        if self.drift_discover_algorithm == DriftDiscoverMode.EDDM or self.drift_discover_algorithm == DriftDiscoverMode.HDDM_W:
+            if f_measure>self.threshold_detector:
+                val = 0
+            else:
+                val = 1
+
+            in_drift, in_warning = self.adwin.update(val)
+        else:
+            in_drift, in_warning = self.adwin.update(f_measure)
+
+        if in_warning:
+            self.warning_drift.append(self.processed_traces)
         if in_drift:
-            number_of_traces_to_be_removed = len(self.window_queue) - int(self.adwin.width)
+            self.concept_drift = self.processed_traces
+            if self.drift_discover_algorithm == DriftDiscoverMode.ADWIN:
+                number_of_traces_to_be_removed = len(self.window_queue) - int(self.adwin.width)
+            else:
+                try:
+                    #print(len(self.window_queue), (self.concept_drift-self.warning_drift[0]))
+                    number_of_traces_to_be_removed = len(self.window_queue) - (
+                                self.concept_drift - self.warning_drift[0])
+
+                except:
+                    number_of_traces_to_be_removed = len(self.window_queue) - (
+                            self.concept_drift)
+                self.warning_drift.clear()
             for i in range(number_of_traces_to_be_removed):
                 old_trace = self.window_queue.popleft()
                 self.variants[old_trace] -= 1
@@ -569,7 +638,7 @@ class Miner:
         update = 'D' if self.update else 'S'
         top_variants = 'P' if self.top is None else self.top
         file = f'{self.order.name}.{self.algo.name}.{self.cut}.{top_variants}.{filtering}.{frequency}.{update}'
-        folder = path.join('results', self.log_name, 'report')
+        folder = path.join('results_'+self.result_name, self.log_name, 'report')
         makedirs(folder, exist_ok=True)
         top_variants = max(len(variants.keys()) for variants in self.drift_variants)
         columns = ['trace', 'places', 'transitions', 'arcs', 'ext_cardoso',
@@ -581,7 +650,7 @@ class Miner:
                       current_variants.items()] + [None] * (top_variants - len(current_variants))
             report.loc[len(report)] = [self.drift_moments[index], *self.compute_model_complexity(index), *traces]
         report.to_csv(path.join(folder, file + '.csv'))
-        folder = path.join('results', self.log_name, 'evaluation')
+        folder = path.join('results_'+self.result_name, self.log_name, 'evaluation')
         makedirs(folder, exist_ok=True)
         columns = ['fitness', 'precision', 'f-measure', 'time']
         evaluation = DataFrame(self.evaluations, columns=columns)
@@ -590,7 +659,7 @@ class Miner:
         evaluation.loc['AVG'] = evaluation.mean()
         evaluation.loc['TOT'] = [None, None, None, total_time]
         evaluation.to_csv(path.join(folder, file + '.csv'))
-        folder = path.join('results', self.log_name, 'petri')
+        folder = path.join('results_'+self.result_name, self.log_name, 'petri')
         makedirs(folder, exist_ok=True)
         #for index, model in enumerate(self.models):
         #    model_info = f'-{index}' if self.update else ''
@@ -603,7 +672,7 @@ class Miner:
         :param y_log: booleano per l'utilizzo di una scala logaritmica sull'asse delle ordinate
         """
         file = ('frequency' if self.order == Order.FRQ else 'length') + '_histogram.png'
-        folder = path.join('results', self.log_name)
+        folder = path.join('results_'+self.result_name, self.log_name)
         makedirs(folder, exist_ok=True)
         if not path.isfile(path.join(folder, file)):
             y_axis = self.variants.values() if self.order == Order.FRQ else [len(v) for v in self.variants.keys()]
@@ -616,12 +685,12 @@ class Miner:
             pyplot.savefig(path.join(folder, file))
 
     @staticmethod
-    def generate_summary(log_name):
+    def generate_summary(log_name, result_name):
         """
         Genera una visualizzazione sintetica dei risultati ottenuti
         :param log_name: nome del log per il quale generare un sommario dei risultati
         """
-        folder = path.join('results', log_name)
+        folder = path.join('results_'+ result_name, log_name)
         if not path.isdir(folder):
             print('No results found')
             return
